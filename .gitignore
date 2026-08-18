@@ -1,0 +1,9 @@
+out/
+ar-launcher.apk
+ar-launcher.apk.idsig
+__pycache__/
+*.pyc
+capture/
+*.key
+*.keystore
+.DS_Store
