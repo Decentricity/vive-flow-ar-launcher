@@ -36,8 +36,8 @@ rm -f "$OUT"/*.apk "$OUT"/classes.dex "$OUT"/res.zip
   --auto-add-overlay \
   --min-sdk-version 25 \
   --target-sdk-version 28 \
-  --version-code 1 \
-  --version-name 1.0 \
+  --version-code 8 \
+  --version-name 1.6.0 \
   "$OUT/res.zip"
 
 find "$GEN" -name 'R.java' >/dev/null

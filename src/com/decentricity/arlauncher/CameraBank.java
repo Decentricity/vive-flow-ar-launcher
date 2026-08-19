@@ -20,6 +20,7 @@ import android.util.Size;
 import android.view.Surface;
 
 import java.nio.ByteBuffer;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -71,6 +72,7 @@ final class CameraBank {
         decodeThread.start();
         decode = new Handler(decodeThread.getLooper());
         running = true;
+        Log.i(TAG, "Camera2 ids: " + Arrays.toString(ids));
         int n = Math.min(EYES, ids.length);
         for (int i = 0; i < n; i++) {
             streams[i] = new Stream(i, ids[i]);
@@ -131,11 +133,29 @@ final class CameraBank {
         }
     }
 
+    private boolean switchRightToAlt() {
+        if (streams[1] == null || ids.length < 3) return false;
+        String alt = ids[2];
+        if (alt.equals(streams[1].id)) return false;
+        Log.w(TAG, "CAM1 busy, trying camera id " + alt + " for right eye");
+        emitLabel(1, "R CAM1 stuck — trying CAM" + alt);
+        streams[1].id = alt;
+        streams[1].reopenDelayMs = 800;
+        streams[1].scheduleReopen(400);
+        return true;
+    }
+
     private void openNextAfter(int index) {
-        if (!running || index != 0) return;
-        if (streams[1] != null && streams[1].device == null) {
-            streams[1].open();
-        }
+        if (!running || index != 0 || bg == null) return;
+        bg.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                if (!running) return;
+                if (streams[1] != null && streams[1].device == null) {
+                    streams[1].open();
+                }
+            }
+        }, 600);
     }
 
     private void emitLabel(final int index, final String text) {
@@ -164,9 +184,11 @@ final class CameraBank {
 
     private final class Stream {
         final int index;
-        final String id;
+        String id;
         final AtomicBoolean dropping = new AtomicBoolean();
         final AtomicBoolean reopenPosted = new AtomicBoolean();
+        volatile boolean closing;
+        int reopenDelayMs = 2000;
         CameraDevice device;
         CameraCaptureSession session;
         ImageReader reader;
@@ -238,6 +260,7 @@ final class CameraBank {
                             camera.close();
                             return;
                         }
+                        closing = false;
                         device = camera;
                         startSession(camera);
                     }
@@ -246,6 +269,7 @@ final class CameraBank {
                     public void onDisconnected(CameraDevice camera) {
                         camera.close();
                         if (device == camera) device = null;
+                        if (closing || !running) return;
                         emitLabel(index, eyeName(index) + " CAM" + index + " dropped — reopening");
                         scheduleReopen();
                     }
@@ -254,10 +278,14 @@ final class CameraBank {
                     public void onError(CameraDevice camera, int error) {
                         camera.close();
                         if (device == camera) device = null;
+                        if (closing || !running) return;
+                        boolean busy = error == CameraDevice.StateCallback.ERROR_CAMERA_IN_USE
+                                || error == CameraDevice.StateCallback.ERROR_MAX_CAMERAS_IN_USE;
                         emitLabel(index, eyeName(index) + " CAM" + index + " HAL "
                                 + errorName(error) + " — retry");
                         if (index == 0) openNextAfter(0);
-                        scheduleReopen();
+                        if (busy && index == 1 && switchRightToAlt()) return;
+                        scheduleReopen(busy ? 5000 : 0);
                     }
 
                     @Override
@@ -269,8 +297,13 @@ final class CameraBank {
                 emitLabel(index, eyeName(index) + " CAM" + index + " SECURITY " + se.getMessage());
             } catch (Exception e) {
                 Log.w(TAG, "open " + id, e);
-                emitLabel(index, eyeName(index) + " CAM" + index + " OPEN FAIL " + e.getMessage());
-                scheduleReopen();
+                String msg = e.getMessage() != null ? e.getMessage() : "";
+                boolean busy = msg.contains("already open") || msg.contains("CAMERA_IN_USE")
+                        || msg.contains("IN_USE");
+                emitLabel(index, eyeName(index) + " CAM" + index
+                        + (busy ? " BUSY — backing off" : " OPEN FAIL " + msg));
+                if (busy && index == 1 && switchRightToAlt()) return;
+                scheduleReopen(busy ? 5000 : 0);
             }
         }
 
@@ -291,9 +324,10 @@ final class CameraBank {
                                             camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
                                     req.addTarget(reader.getSurface());
                                     sess.setRepeatingRequest(req.build(), null, bg);
-                                    emitLabel(index, eyeName(index) + " CAM" + index + " id=" + camera.getId()
+                                    emitLabel(index, eyeName(index) + " CAM" + index + " id=" + id
                                             + " " + facing + " orient=" + orient + " "
                                             + size.getWidth() + "x" + size.getHeight() + " LIVE");
+                                    reopenDelayMs = 2000;
                                     openNextAfter(index);
                                 } catch (Exception e) {
                                     emitLabel(index, eyeName(index) + " CAM" + index
@@ -316,15 +350,21 @@ final class CameraBank {
         }
 
         void scheduleReopen() {
+            scheduleReopen(0);
+        }
+
+        void scheduleReopen(int minDelayMs) {
             if (!running || bg == null) return;
             if (!reopenPosted.compareAndSet(false, true)) return;
+            int delay = Math.max(minDelayMs, reopenDelayMs);
+            reopenDelayMs = Math.min(12000, Math.max(2000, reopenDelayMs) * 2);
             bg.postDelayed(new Runnable() {
                 @Override
                 public void run() {
                     reopenPosted.set(false);
                     if (running && device == null) open();
                 }
-            }, 900);
+            }, delay);
         }
 
         void queueDecode(Image image) {
@@ -359,6 +399,7 @@ final class CameraBank {
         }
 
         void close() {
+            closing = true;
             try {
                 if (session != null) session.close();
             } catch (Exception ignored) {

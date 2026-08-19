@@ -2,13 +2,16 @@ package com.decentricity.arlauncher;
 
 import android.app.Activity;
 import android.content.Context;
+import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Matrix;
 import android.graphics.Paint;
 import android.graphics.Path;
+import android.graphics.RectF;
 import android.graphics.Typeface;
 import android.hardware.Sensor;
 import android.hardware.SensorEvent;
@@ -18,7 +21,11 @@ import android.os.BatteryManager;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.Process;
 import android.os.SystemClock;
+import android.text.Layout;
+import android.text.StaticLayout;
+import android.text.TextPaint;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.KeyEvent;
@@ -32,11 +39,10 @@ import android.widget.TextView;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
-import java.util.Iterator;
 import java.util.Locale;
-import java.util.Random;
 
-public class MainActivity extends Activity implements SensorEventListener, CameraBank.Listener {
+public class MainActivity extends Activity implements SensorEventListener,
+        CameraBank.Listener, ScreenRecorder.Listener {
     /**
      * Measured from cam0/cam1 stills of the monitor bank (640x480, already upright).
      * Same world point is 124px left / 10px up in CAM1 vs CAM0 (crossed + slight vertical).
@@ -64,8 +70,53 @@ public class MainActivity extends Activity implements SensorEventListener, Camer
     private static final int COMPASS_TAPE_DP = 28;
     private static final int HUD_RED = 0xFFFF4A3A;
     private static final long CLICK_MARK_MS = 1600L;
+    /** White guide line. Off for the launcher; flip on to debug the heading lock. */
+    private static final boolean SHOW_GUIDE = false;
+    /** Red attitude bar. Off so the app grid is the only thing on that plane. */
+    private static final boolean SHOW_HORIZON_BAR = false;
+    private static final boolean SHOW_SCANLINES = false;
+    private static final String[] APP_NAMES = {
+            "HedgeyOS", "Cat", "Dog", "Lizard", "Record", "Writer"
+    };
+    private static final int[] APP_TINT = {
+            0xFFE8AFA4, 0xFFE07A3D, 0xFFC9A227, 0xFF3D9A5F, 0xFFE53935, 0xFF4A90D9
+    };
+    private static final int KIND_NONE = 0;
+    private static final int KIND_WRITER = 1;
+    private static final int KIND_ABOUT = 2;
+    private static final int KIND_RECORD = 3;
+    private static final int[] APP_KIND = {
+            KIND_ABOUT, KIND_NONE, KIND_NONE, KIND_NONE, KIND_RECORD, KIND_WRITER
+    };
+    private static final int APP_COLS = 3;
+    private static final int APP_ROWS = 2;
+    private static final int WINDOW_NONE = 0;
+    private static final int WINDOW_MISSING = 1;
+    private static final int WINDOW_WRITER = 2;
+    private static final int WINDOW_ABOUT = 3;
+    private static final int WINDOW_RECORD = 4;
+    private static final long NO_APP_MS = 2400L;
+    private static final String RECORD_HELP =
+            "Press a time, then Record. The visor is snapped every 1/4 second "
+            + "into a video on this headset. Recording keeps going if you close "
+            + "this window.";
+    private static final String LOREM =
+            "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do "
+            + "eiusmod tempor incididunt ut labore et dolore magna aliqua. "
+            + "Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris.";
+    private static final int DRAFT_MAX = 4000;
+    private static final String NO_APP_MSG = "No such app found! closing...";
+    private static final String ABOUT_TEXT =
+            "HedgeyOS\n\n"
+            + "Your pocket Debian desktop.\n\n"
+            + "A storybook Linux workstation for ARM64 Android — Debian 13, "
+            + "XFCE, and a hedgehog.\n\n"
+            + "github.com/hedgeyos/hedgeyos";
+    private final StringBuilder draft = new StringBuilder(LOREM);
+    private final LauncherState launcher = new LauncherState();
+    private final ScreenRecorder recorder = new ScreenRecorder(this);
+    private Bitmap hedgeyIcon;
     private final ArrayList<ClickMark> clickMarks = new ArrayList<ClickMark>();
-    private final Random clickRng = new Random();
     private float gazeYaw;
     private float gazePitch;
     private float lookHeading;
@@ -86,6 +137,7 @@ public class MainActivity extends Activity implements SensorEventListener, Camer
     private Sensor gravSensor;
     private CameraBank cameras;
     private boolean camsStarted;
+    private boolean restarting;
     private final boolean[] camOk = new boolean[2];
     private final Runnable stopCamDelayed = new Runnable() {
         @Override
@@ -121,6 +173,8 @@ public class MainActivity extends Activity implements SensorEventListener, Camer
         if (gravSensor == null) {
             gravSensor = sensors.getDefaultSensor(Sensor.TYPE_ACCELEROMETER);
         }
+        hedgeyIcon = BitmapFactory.decodeResource(getResources(), R.drawable.hedgeyos_icon);
+        recorder.attach(this);
 
         LinearLayout stereo = new LinearLayout(this);
         stereo.setBackgroundColor(Color.BLACK);
@@ -160,11 +214,13 @@ public class MainActivity extends Activity implements SensorEventListener, Camer
                 FrameLayout.LayoutParams.MATCH_PARENT));
         feeds[eye] = feed;
 
-        root.addView(new Scanlines(this), new FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.MATCH_PARENT));
+        if (SHOW_SCANLINES) {
+            root.addView(new Scanlines(this), new FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    FrameLayout.LayoutParams.MATCH_PARENT));
+        }
 
-        Horizon horizon = new Horizon(this, clickMarks);
+        Horizon horizon = new Horizon(this, clickMarks, launcher, draft, hedgeyIcon, recorder);
         root.addView(horizon, new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT));
@@ -195,22 +251,6 @@ public class MainActivity extends Activity implements SensorEventListener, Camer
         topLp.gravity = Gravity.CENTER;
         topLp.topMargin = -dp(54);
         root.addView(topRow, topLp);
-
-        LinearLayout botRow = new LinearLayout(this);
-        botRow.setOrientation(LinearLayout.HORIZONTAL);
-        botRow.setGravity(Gravity.CENTER_VERTICAL);
-        camChips[eye][0] = hudLabel("L --");
-        camChips[eye][1] = hudLabel("R --");
-        botRow.addView(camChips[eye][0]);
-        View gap = new View(this);
-        botRow.addView(gap, new LinearLayout.LayoutParams(dp(36), 1));
-        botRow.addView(camChips[eye][1]);
-        FrameLayout.LayoutParams botLp = new FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                FrameLayout.LayoutParams.WRAP_CONTENT);
-        botLp.gravity = Gravity.CENTER;
-        botLp.topMargin = dp(50);
-        root.addView(botRow, botLp);
         return root;
     }
 
@@ -233,6 +273,7 @@ public class MainActivity extends Activity implements SensorEventListener, Camer
     @Override
     protected void onResume() {
         super.onResume();
+        if (restarting) return;
         if (rotSensor != null) {
             sensors.registerListener(this, rotSensor, SensorManager.SENSOR_DELAY_FASTEST);
         }
@@ -248,8 +289,9 @@ public class MainActivity extends Activity implements SensorEventListener, Camer
     @Override
     public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);
-        if (hasFocus) {
+        if (hasFocus && !restarting) {
             maybeStartCameras();
+            grabKeyboard();
         }
     }
 
@@ -264,61 +306,164 @@ public class MainActivity extends Activity implements SensorEventListener, Camer
                 return true;
             }
         }
+        if (typeKey(event)) return true;
         return super.dispatchKeyEvent(event);
+    }
+
+    private void grabKeyboard() {
+        if (horizons[0] != null) {
+            horizons[0].setFocusable(true);
+            horizons[0].setFocusableInTouchMode(true);
+            horizons[0].requestFocus();
+        }
     }
 
     /**
      * Gaze mouse: the reticle is always the pointer (view center). Volume up is
-     * primary click, volume down is secondary. Primary parks the guide line on
-     * the heading the reticle is looking at. Secondary still stamps a debug n-gon.
+     * primary click (open / close). Volume down snaps the hidden guide — and
+     * therefore the grid and any open window — to the reticle heading.
      */
     protected void onGazeClick(boolean primary) {
-        pruneClickMarks();
         for (int i = 0; i < 2; i++) {
             if (reticles[i] != null) reticles[i].pulse(primary);
         }
-        if (primary) {
-            float snap = headingNow(true);
-            if (!Float.isNaN(snap)) {
-                lookHeading = snap;
-                haveLookHeading = true;
-                guideYaw = snap;
-                haveGuide = true;
-                applyHorizon();
+        if (!primary) {
+            snapGuide();
+            return;
+        }
+        if (launcher.hoverRestart) {
+            restartApp();
+            return;
+        }
+        if (launcher.window != WINDOW_NONE) {
+            if (launcher.hoverClose) {
+                closeWindow();
+                return;
+            }
+            if (launcher.window == WINDOW_RECORD) {
+                if (launcher.hoverChip >= 0) {
+                    recorder.setPreset(launcher.hoverChip);
+                    invalidateHorizons();
+                    return;
+                }
+                if (launcher.hoverRecord) {
+                    maybeToggleRecord();
+                    return;
+                }
             }
             return;
         }
-        ClickMark mark = new ClickMark();
-        mark.pitch = gazePitch;
-        mark.sides = 3 + clickRng.nextInt(6);
-        mark.spin = clickRng.nextFloat() * 360f;
-        mark.radius = 16f + clickRng.nextFloat() * 18f;
-        mark.primary = primary;
-        mark.born = SystemClock.uptimeMillis();
-        clickMarks.add(mark);
-        for (int i = 0; i < 2; i++) {
-            if (horizons[i] != null) horizons[i].invalidate();
+        if (launcher.hover >= 0 && launcher.hover < APP_NAMES.length) {
+            openApp(launcher.hover);
         }
+    }
+
+    private void snapGuide() {
+        float snap = headingNow(true);
+        if (Float.isNaN(snap)) return;
+        lookHeading = snap;
+        haveLookHeading = true;
+        guideYaw = snap;
+        haveGuide = true;
+        applyHorizon();
+    }
+
+    private void openApp(int index) {
+        launcher.windowApp = index;
+        launcher.windowAt = SystemClock.uptimeMillis();
+        launcher.hoverClose = false;
+        if (APP_KIND[index] == KIND_WRITER) {
+            launcher.window = WINDOW_WRITER;
+            grabKeyboard();
+        } else if (APP_KIND[index] == KIND_ABOUT) {
+            launcher.window = WINDOW_ABOUT;
+        } else if (APP_KIND[index] == KIND_RECORD) {
+            launcher.window = WINDOW_RECORD;
+        } else {
+            launcher.window = WINDOW_MISSING;
+        }
+        invalidateHorizons();
+    }
+
+    private void maybeToggleRecord() {
+        if (checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(
+                    new String[]{android.Manifest.permission.WRITE_EXTERNAL_STORAGE}, 8);
+            return;
+        }
+        recorder.toggle();
+        invalidateHorizons();
+    }
+
+    @Override
+    public void onRecorderChanged() {
+        invalidateHorizons();
+    }
+
+    private void closeWindow() {
+        launcher.window = WINDOW_NONE;
+        launcher.hoverClose = false;
+        invalidateHorizons();
+    }
+
+    /**
+     * Relaunch this APK in place. Do not return to HUE: this app holds CAM0/CAM1
+     * exclusive, and Wave tracking does not reclaim those sensors cleanly.
+     * Headset reboot is a privileged Wave power-menu action, not available here.
+     */
+    private void restartApp() {
+        if (restarting) return;
+        restarting = true;
+        ui.removeCallbacks(stopCamDelayed);
+        recorder.stop();
+        stopCameras();
+        Intent i = new Intent(this, MainActivity.class);
+        i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK);
+        startActivity(i);
         ui.postDelayed(new Runnable() {
             @Override
             public void run() {
-                pruneClickMarks();
-                for (int i = 0; i < 2; i++) {
-                    if (horizons[i] != null) horizons[i].invalidate();
-                }
+                finishAffinity();
+                Process.killProcess(Process.myPid());
             }
-        }, CLICK_MARK_MS + 50);
+        }, 200);
     }
 
-    private void pruneClickMarks() {
-        long now = SystemClock.uptimeMillis();
-        Iterator<ClickMark> it = clickMarks.iterator();
-        while (it.hasNext()) {
-            if (now - it.next().born > CLICK_MARK_MS) it.remove();
+    private void invalidateHorizons() {
+        for (int i = 0; i < 2; i++) {
+            if (horizons[i] != null) horizons[i].invalidate();
         }
     }
 
+    private boolean typeKey(KeyEvent event) {
+        if (launcher.window != WINDOW_WRITER) return false;
+        if (event.getAction() != KeyEvent.ACTION_DOWN) return false;
+        int code = event.getKeyCode();
+        if (code == KeyEvent.KEYCODE_BACK || code == KeyEvent.KEYCODE_VOLUME_MUTE) {
+            return false;
+        }
+        if (code == KeyEvent.KEYCODE_DEL) {
+            if (draft.length() > 0) draft.deleteCharAt(draft.length() - 1);
+            invalidateHorizons();
+            return true;
+        }
+        if (code == KeyEvent.KEYCODE_FORWARD_DEL) return true;
+        if (code == KeyEvent.KEYCODE_ENTER || code == KeyEvent.KEYCODE_NUMPAD_ENTER) {
+            if (draft.length() < DRAFT_MAX) draft.append('\n');
+            invalidateHorizons();
+            return true;
+        }
+        int u = event.getUnicodeChar();
+        if (u == 0) return false;
+        if (draft.length() >= DRAFT_MAX) return true;
+        draft.append(Character.toChars(u));
+        invalidateHorizons();
+        return true;
+    }
+
     private void maybeStartCameras() {
+        if (restarting) return;
         if (checkSelfPermission(android.Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(new String[]{android.Manifest.permission.CAMERA}, 7);
             setCamChips("L DENY", "R DENY");
@@ -329,9 +474,16 @@ public class MainActivity extends Activity implements SensorEventListener, Camer
 
     @Override
     public void onRequestPermissionsResult(int code, String[] perms, int[] grant) {
+        if (code == 8) {
+            if (grant.length > 0 && grant[0] == PackageManager.PERMISSION_GRANTED) {
+                recorder.toggle();
+                invalidateHorizons();
+            }
+            return;
+        }
         if (code == 7 && grant.length > 0 && grant[0] == PackageManager.PERMISSION_GRANTED) {
             maybeStartCameras();
-        } else {
+        } else if (code == 7) {
             setCamChips("L DENY", "R DENY");
         }
     }
@@ -359,6 +511,12 @@ public class MainActivity extends Activity implements SensorEventListener, Camer
         sensors.unregisterListener(this);
         ui.postDelayed(stopCamDelayed, 2500);
         super.onPause();
+    }
+
+    @Override
+    protected void onDestroy() {
+        recorder.release();
+        super.onDestroy();
     }
 
     @Override
@@ -594,6 +752,17 @@ public class MainActivity extends Activity implements SensorEventListener, Camer
         return (float) (Math.tan(Math.toRadians(p)) / den * imgHalf);
     }
 
+    private static final class LauncherState {
+        int hover = -1;
+        boolean hoverClose;
+        boolean hoverRestart;
+        int hoverChip = -1;
+        boolean hoverRecord;
+        int window = WINDOW_NONE;
+        int windowApp;
+        long windowAt;
+    }
+
     private static final class ClickMark {
         float pitch;
         int sides;
@@ -610,17 +779,50 @@ public class MainActivity extends Activity implements SensorEventListener, Camer
         private final Paint markStroke = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint guidePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint guideText = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint iconGlass = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint iconRing = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint glyph = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint iconLabel = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint winFill = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint winStroke = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint winTitleFill = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint closeFill = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint closeXPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint titlePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint caret = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final TextPaint body = new TextPaint(Paint.ANTI_ALIAS_FLAG);
+        private final RectF winBox = new RectF();
+        private final RectF titleBar = new RectF();
+        private final RectF menuBar = new RectF();
+        private final Path glyphPath = new Path();
+        private final RectF oval = new RectF();
+        private final float[] mapped = new float[2];
         private final Path markPath = new Path();
         private final ArrayList<ClickMark> marks;
+        private final LauncherState state;
+        private final StringBuilder draft;
+        private final Bitmap hedgeyIcon;
+        private final ScreenRecorder recorder;
+        private final Paint bitmapPaint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
+        private final Path iconClip = new Path();
+        private final RectF iconDest = new RectF();
+        private final RectF chipRect = new RectF();
+        private final Paint chipFill = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint recDot = new Paint(Paint.ANTI_ALIAS_FLAG);
         private float pitch;
         private float roll;
         private float yaw;
         private float heading;
         private float guideYaw = Float.NaN;
 
-        Horizon(Context context, ArrayList<ClickMark> marks) {
+        Horizon(Context context, ArrayList<ClickMark> marks, LauncherState state,
+                StringBuilder draft, Bitmap hedgeyIcon, ScreenRecorder recorder) {
             super(context);
             this.marks = marks;
+            this.state = state;
+            this.draft = draft;
+            this.hedgeyIcon = hedgeyIcon;
+            this.recorder = recorder;
             paint.setColor(0xAAFF2A22);
             paint.setStyle(Paint.Style.STROKE);
             paint.setStrokeWidth(2.2f);
@@ -640,12 +842,43 @@ public class MainActivity extends Activity implements SensorEventListener, Camer
             guideText.setTextAlign(Paint.Align.CENTER);
             guideText.setTextSize(compassSize * 0.5f);
             guideText.setShadowLayer(3f, 1f, 1f, 0xFF000000);
+            iconGlass.setStyle(Paint.Style.FILL);
+            iconRing.setStyle(Paint.Style.STROKE);
+            glyph.setStrokeCap(Paint.Cap.ROUND);
+            glyph.setStrokeJoin(Paint.Join.ROUND);
+            iconLabel.setColor(0xFFFFFFFF);
+            iconLabel.setTypeface(Typeface.SANS_SERIF);
+            iconLabel.setTextAlign(Paint.Align.CENTER);
+            iconLabel.setShadowLayer(4f, 0f, 1f, 0xCC000000);
+            winFill.setColor(0xE6141418);
+            winFill.setStyle(Paint.Style.FILL);
+            winStroke.setColor(0x66FFFFFF);
+            winStroke.setStyle(Paint.Style.STROKE);
+            winStroke.setStrokeWidth(2f);
+            winTitleFill.setColor(0x33FFFFFF);
+            winTitleFill.setStyle(Paint.Style.FILL);
+            closeFill.setStyle(Paint.Style.FILL);
+            closeXPaint.setColor(0xFFFFFFFF);
+            closeXPaint.setStyle(Paint.Style.STROKE);
+            closeXPaint.setStrokeCap(Paint.Cap.ROUND);
+            titlePaint.setColor(0xFFFFFFFF);
+            titlePaint.setTypeface(Typeface.SANS_SERIF);
+            titlePaint.setTextAlign(Paint.Align.CENTER);
+            caret.setColor(0xFFE8E8EA);
+            caret.setStrokeWidth(2f);
+            body.setColor(0xFFE8E8EA);
+            body.setTypeface(Typeface.SANS_SERIF);
+            body.setTextSize(compassSize * 0.55f);
+            body.setAntiAlias(true);
             markFill.setStyle(Paint.Style.FILL);
             markStroke.setStyle(Paint.Style.STROKE);
             markStroke.setStrokeWidth(2.4f);
+            recDot.setStyle(Paint.Style.FILL);
+            recDot.setColor(0xFFE53935);
             setWillNotDraw(false);
-            setClickable(false);
-            setFocusable(false);
+            setClickable(true);
+            setFocusable(true);
+            setFocusableInTouchMode(true);
         }
 
         void setAttitude(float pitchDeg, float rollDeg, float yawDeg,
@@ -669,22 +902,52 @@ public class MainActivity extends Activity implements SensorEventListener, Camer
             canvas.save();
             canvas.rotate(roll, cx, cy);
             canvas.translate(0, dy);
-            canvas.drawLine(cx - arm, cy, cx - 18, cy, paint);
-            canvas.drawLine(cx + 18, cy, cx + arm, cy, paint);
-            canvas.drawLine(cx - arm, cy - 6, cx - arm, cy + 6, paint);
-            canvas.drawLine(cx + arm, cy - 6, cx + arm, cy + 6, paint);
-            String label = String.format(Locale.US, "P%+.1f  R%+.1f  Y%.0f", pitch, roll, yaw);
-            canvas.drawText(label, cx, cy - 6 - text.descent(), text);
-            drawGuide(canvas, w, cx, cy);
-            drawClickMarks(canvas, cx, cy);
+            if (SHOW_HORIZON_BAR) {
+                canvas.drawLine(cx - arm, cy, cx - 18, cy, paint);
+                canvas.drawLine(cx + 18, cy, cx + arm, cy, paint);
+                canvas.drawLine(cx - arm, cy - 6, cx - arm, cy + 6, paint);
+                canvas.drawLine(cx + arm, cy - 6, cx + arm, cy + 6, paint);
+                String label = String.format(Locale.US, "P%+.1f  R%+.1f  Y%.0f", pitch, roll, yaw);
+                canvas.drawText(label, cx, cy - 6 - text.descent(), text);
+            }
+            if (SHOW_GUIDE) drawGuide(canvas, w, cx, cy);
+            if (state.window == WINDOW_MISSING
+                    && SystemClock.uptimeMillis() - state.windowAt >= NO_APP_MS) {
+                state.window = WINDOW_NONE;
+                state.hoverClose = false;
+            }
+            if (state.window != WINDOW_NONE) {
+                state.hover = -1;
+                state.hoverRestart = false;
+                drawWindow(canvas, w, h, cx, cy, dy);
+            } else {
+                drawAppGrid(canvas, w, h, cx, cy, dy);
+            }
+            if (SHOW_GUIDE) drawClickMarks(canvas, cx, cy);
             canvas.restore();
+            if (recorder.isRecording()) {
+                recDot.setColor(0xFFE53935);
+                float badge = Math.min(w, h) * 0.018f;
+                canvas.drawCircle(badge * 2.2f, badge * 2.2f, badge, recDot);
+                iconLabel.setTextSize(badge * 1.3f);
+                iconLabel.setTextAlign(Paint.Align.LEFT);
+                iconLabel.setColor(0xFFFFE0E0);
+                canvas.drawText("REC", badge * 3.6f, badge * 2.2f + iconLabel.getTextSize() * 0.35f,
+                        iconLabel);
+                iconLabel.setTextAlign(Paint.Align.CENTER);
+                postInvalidateDelayed(200);
+            }
+        }
+
+        private float guideLocalX(float cx, int w) {
+            if (Float.isNaN(guideYaw)) return Float.NaN;
+            float hfov = CAMERA_VFOV_DEG / CAM_PREVIEW_ASPECT;
+            return cx + wrapDeg(guideYaw - heading) * (w / hfov);
         }
 
         private void drawGuide(Canvas canvas, int w, float cx, float cy) {
-            if (Float.isNaN(guideYaw)) return;
-            float hfov = CAMERA_VFOV_DEG / CAM_PREVIEW_ASPECT;
-            float pxPerDeg = w / hfov;
-            float x = cx + wrapDeg(guideYaw - heading) * pxPerDeg;
+            float x = guideLocalX(cx, w);
+            if (Float.isNaN(x)) return;
             float arm = Math.min(w, getHeight()) * 0.30f;
             if (x + arm < 0 || x - arm > w) return;
             canvas.drawLine(x - arm, cy, x - 16, cy, guidePaint);
@@ -697,6 +960,363 @@ public class MainActivity extends Activity implements SensorEventListener, Camer
                     x, cy + 18 + guideText.getTextSize(), guideText);
         }
 
+        private void drawAppGrid(Canvas canvas, int w, int h, float cx, float cy, float dy) {
+            float gx = guideLocalX(cx, w);
+            if (Float.isNaN(gx)) {
+                state.hover = -1;
+                state.hoverRestart = false;
+                return;
+            }
+            float min = Math.min(w, h);
+            float r = min * 0.046f;
+            float gapX = r * 2.75f;
+            float gapY = r * 3.2f;
+            float gridW = gapX * (APP_COLS - 1);
+            float gridH = gapY * (APP_ROWS - 1);
+            if (gx + gridW * 0.5f + r * 2f < 0 || gx - gridW * 0.5f - r * 2f > w) {
+                state.hover = -1;
+                state.hoverRestart = false;
+                return;
+            }
+            float originX = gx - gridW * 0.5f;
+            float originY = cy - gridH * 0.5f;
+            drawMenuBar(canvas, gx, originY, gridW, r, cx, cy, dy);
+            iconLabel.setTextSize(r * 0.42f);
+            int hover = -1;
+            float best = r * 1.55f;
+            int n = APP_NAMES.length;
+            for (int i = 0; i < n; i++) {
+                int col = i % APP_COLS;
+                int row = i / APP_COLS;
+                float ix = originX + col * gapX;
+                float iy = originY + row * gapY;
+                mapToView(ix, iy, cx, cy, dy, roll, mapped);
+                float dist = (float) Math.hypot(mapped[0] - cx, mapped[1] - cy);
+                if (dist < best) {
+                    best = dist;
+                    hover = i;
+                }
+            }
+            state.hover = state.hoverRestart ? -1 : hover;
+            for (int i = 0; i < n; i++) {
+                int col = i % APP_COLS;
+                int row = i / APP_COLS;
+                float ix = originX + col * gapX;
+                float iy = originY + row * gapY;
+                boolean hot = i == hover && !state.hoverRestart;
+                float ir = r * (hot ? 1.12f : 1f);
+                if (i == 0 && hedgeyIcon != null) {
+                    drawHedgeyIcon(canvas, ix, iy, ir);
+                } else {
+                    iconGlass.setColor(hot ? 0xCCFFFFFF : 0x99FFFFFF);
+                    canvas.drawCircle(ix, iy, ir, iconGlass);
+                    glyph.setColor(APP_TINT[i]);
+                    drawGlyph(canvas, i, ix, iy, ir * 0.62f);
+                }
+                iconRing.setStrokeWidth(hot ? 3.2f : 2.0f);
+                iconRing.setColor(hot ? 0xFFFFFFFF : 0x66FFFFFF);
+                canvas.drawCircle(ix, iy, ir, iconRing);
+                iconLabel.setColor(hot ? 0xFFFFFFFF : 0xEEFFFFFF);
+                canvas.drawText(APP_NAMES[i], ix, iy + ir + iconLabel.getTextSize() * 1.15f, iconLabel);
+            }
+        }
+
+        private void drawMenuBar(Canvas canvas, float gx, float originY, float gridW,
+                float r, float cx, float cy, float dy) {
+            float barH = r * 0.62f;
+            float barW = gridW + r * 2.2f;
+            float left = gx - barW * 0.5f;
+            float right = gx + barW * 0.5f;
+            float bot = originY - r * 1.85f;
+            float top = bot - barH;
+            menuBar.set(left, top, right, bot);
+            canvas.drawRoundRect(menuBar, barH * 0.34f, barH * 0.34f, winFill);
+            canvas.drawRoundRect(menuBar, barH * 0.34f, barH * 0.34f, winStroke);
+
+            float pad = barH * 0.16f;
+            float restartW = barH * 3.35f;
+            chipRect.set(right - pad - restartW, top + pad, right - pad, bot - pad);
+            boolean hot = chipRect.contains(cx, cy - dy);
+            state.hoverRestart = hot;
+            chipFill.setStyle(Paint.Style.FILL);
+            chipFill.setColor(hot ? 0xCCFFFFFF : 0x33FFFFFF);
+            canvas.drawRoundRect(chipRect, 6f, 6f, chipFill);
+            chipFill.setStyle(Paint.Style.STROKE);
+            chipFill.setStrokeWidth(hot ? 2.4f : 1.4f);
+            chipFill.setColor(hot ? 0xFFFFFFFF : 0x88FFFFFF);
+            canvas.drawRoundRect(chipRect, 6f, 6f, chipFill);
+            titlePaint.setTextSize(barH * 0.38f);
+            titlePaint.setColor(hot ? 0xFF111111 : 0xFFFFFFFF);
+            float base = chipRect.centerY() - (titlePaint.ascent() + titlePaint.descent()) / 2f;
+            canvas.drawText("Restart", chipRect.centerX(), base, titlePaint);
+            titlePaint.setColor(0xFFFFFFFF);
+        }
+
+        private void drawWindow(Canvas canvas, int w, int h, float cx, float cy, float dy) {
+            float gx = guideLocalX(cx, w);
+            state.hoverClose = false;
+            state.hoverChip = -1;
+            state.hoverRecord = false;
+            if (Float.isNaN(gx)) return;
+            float min = Math.min(w, h);
+            boolean writer = state.window == WINDOW_WRITER;
+            boolean about = state.window == WINDOW_ABOUT;
+            boolean record = state.window == WINDOW_RECORD;
+            float boxW = min * (writer || about || record ? 0.62f : 0.52f);
+            float boxH = min * (record ? 0.48f : writer ? 0.38f : about ? 0.44f : 0.24f);
+            float titleH = min * 0.048f;
+            float left = gx - boxW * 0.5f;
+            float top = cy - boxH * 0.5f;
+            winBox.set(left, top, left + boxW, top + boxH);
+            if (winBox.right < -20 || winBox.left > w + 20) return;
+            float rad = Math.min(16f, titleH * 0.45f);
+            canvas.drawRoundRect(winBox, rad, rad, winFill);
+            canvas.drawRoundRect(winBox, rad, rad, winStroke);
+            titleBar.set(winBox.left, winBox.top, winBox.right, winBox.top + titleH);
+            canvas.drawRoundRect(titleBar, rad, rad, winTitleFill);
+            canvas.drawRect(winBox.left, winBox.top + titleH * 0.4f, winBox.right,
+                    winBox.top + titleH, winTitleFill);
+
+            float closeX = winBox.left + titleH * 0.55f;
+            float closeY = winBox.top + titleH * 0.5f;
+            float closeR = titleH * 0.28f;
+            mapToView(closeX, closeY, cx, cy, dy, roll, mapped);
+            boolean hot = Math.hypot(mapped[0] - cx, mapped[1] - cy) < closeR * 3.2f;
+            state.hoverClose = hot;
+            closeFill.setColor(hot ? 0xFFFF7A73 : 0xFFE85D55);
+            canvas.drawCircle(closeX, closeY, closeR, closeFill);
+            closeXPaint.setStrokeWidth(Math.max(1.6f, closeR * 0.28f));
+            float xarm = closeR * 0.38f;
+            canvas.drawLine(closeX - xarm, closeY - xarm, closeX + xarm, closeY + xarm, closeXPaint);
+            canvas.drawLine(closeX - xarm, closeY + xarm, closeX + xarm, closeY - xarm, closeXPaint);
+
+            int app = state.windowApp;
+            if (app < 0 || app >= APP_NAMES.length) app = 0;
+            String title = writer ? "Writer" : about ? "About" : record ? "Record" : APP_NAMES[app];
+            titlePaint.setTextSize(titleH * 0.42f);
+            float titleBase = winBox.top + (titleH - titlePaint.ascent() - titlePaint.descent()) / 2f;
+            canvas.drawText(title, gx, titleBase, titlePaint);
+
+            float pad = titleH * 0.35f;
+            float contentLeft = winBox.left + pad;
+            float contentTop = winBox.top + titleH + pad;
+            float contentRight = winBox.right - pad;
+            float contentBot = winBox.bottom - pad;
+            if (record) {
+                drawRecordPanel(canvas, cx, gx, cy, dy, contentLeft, contentTop, contentRight,
+                        contentBot, titleH, pad);
+                if (recorder.isRecording()) postInvalidateDelayed(200);
+                return;
+            }
+            if (about && hedgeyIcon != null) {
+                float pic = Math.min(titleH * 2.2f, (contentBot - contentTop) * 0.28f);
+                float cyPic = contentTop + pic;
+                drawHedgeyIcon(canvas, gx, cyPic, pic);
+                contentTop = cyPic + pic + pad * 0.5f;
+            }
+            int inner = Math.max(8, (int) (contentRight - contentLeft));
+            CharSequence src = writer ? draft : about ? ABOUT_TEXT : NO_APP_MSG;
+            body.setTextAlign(Paint.Align.LEFT);
+            StaticLayout layout = StaticLayout.Builder
+                    .obtain(src, 0, src.length(), body, inner)
+                    .setAlignment(writer ? Layout.Alignment.ALIGN_NORMAL
+                            : Layout.Alignment.ALIGN_CENTER)
+                    .setIncludePad(false)
+                    .build();
+            canvas.save();
+            canvas.clipRect(contentLeft, contentTop, contentRight, contentBot);
+            float textY = contentTop;
+            if (!writer) {
+                float blockH = layout.getHeight();
+                textY = contentTop + Math.max(0f, (contentBot - contentTop - blockH) * 0.15f);
+            }
+            canvas.translate(contentLeft, textY);
+            layout.draw(canvas);
+            if (writer && (SystemClock.uptimeMillis() / 450L) % 2L == 0L) {
+                int last = Math.max(0, layout.getLineCount() - 1);
+                float cxCaret = layout.getLineRight(last);
+                canvas.drawLine(cxCaret + 1f, layout.getLineTop(last),
+                        cxCaret + 1f, layout.getLineBottom(last), caret);
+            }
+            canvas.restore();
+            if (writer) postInvalidateDelayed(50);
+        }
+
+        private void drawRecordPanel(Canvas canvas, float cx, float gx, float cy, float dy,
+                float left, float top, float right, float bot, float titleH, float pad) {
+            float rx = cx;
+            float ry = cy - dy;
+            int inner = Math.max(8, (int) (right - left));
+            body.setTextSize(titleH * 0.38f);
+            StaticLayout help = StaticLayout.Builder
+                    .obtain(RECORD_HELP, 0, RECORD_HELP.length(), body, inner)
+                    .setAlignment(Layout.Alignment.ALIGN_CENTER)
+                    .setIncludePad(false)
+                    .build();
+            canvas.save();
+            canvas.translate(left, top);
+            help.draw(canvas);
+            canvas.restore();
+            float y = top + help.getHeight() + pad * 0.8f;
+            float chipH = titleH * 0.95f;
+            float gap = pad * 0.45f;
+            int n = ScreenRecorder.PRESET_LABELS.length;
+            float chipW = (right - left - gap * (n - 1)) / n;
+            int hoverChip = -1;
+            for (int i = 0; i < n; i++) {
+                float x0 = left + i * (chipW + gap);
+                chipRect.set(x0, y, x0 + chipW, y + chipH);
+                boolean on = recorder.preset() == i;
+                boolean hot = chipRect.contains(rx, ry);
+                if (hot) hoverChip = i;
+                chipFill.setStyle(Paint.Style.FILL);
+                chipFill.setColor(on ? 0xCCFFFFFF : hot ? 0x44FFFFFF : 0x22FFFFFF);
+                canvas.drawRoundRect(chipRect, 8f, 8f, chipFill);
+                chipFill.setStyle(Paint.Style.STROKE);
+                chipFill.setStrokeWidth(on ? 2.6f : 1.6f);
+                chipFill.setColor(on || hot ? 0xFFFFFFFF : 0x66FFFFFF);
+                canvas.drawRoundRect(chipRect, 8f, 8f, chipFill);
+                titlePaint.setTextSize(chipH * 0.42f);
+                titlePaint.setColor(on ? 0xFF111111 : 0xFFFFFFFF);
+                float base = chipRect.centerY() - (titlePaint.ascent() + titlePaint.descent()) / 2f;
+                canvas.drawText(ScreenRecorder.PRESET_LABELS[i], chipRect.centerX(), base, titlePaint);
+            }
+            state.hoverChip = hoverChip;
+            titlePaint.setColor(0xFFFFFFFF);
+            y += chipH + pad * 1.1f;
+            float recR = titleH * 0.85f;
+            float recY = Math.min(y + recR, bot - recR - titleH);
+            boolean recHot = Math.hypot(rx - gx, ry - recY) < recR * 1.35f;
+            state.hoverRecord = recHot && hoverChip < 0;
+            boolean recording = recorder.isRecording();
+            recDot.setColor(recording ? (recHot ? 0xFFFFC107 : 0xFFFFB300) : (recHot ? 0xFFFF6B63 : 0xFFE53935));
+            canvas.drawCircle(gx, recY, recR, recDot);
+            if (recording) {
+                chipFill.setColor(0xFF111111);
+                chipFill.setStyle(Paint.Style.FILL);
+                float s = recR * 0.38f;
+                canvas.drawRect(gx - s, recY - s, gx + s, recY + s, chipFill);
+            } else {
+                recDot.setColor(0xFFFFFFFF);
+                canvas.drawCircle(gx, recY, recR * 0.38f, recDot);
+            }
+            titlePaint.setTextSize(titleH * 0.36f);
+            canvas.drawText(recording ? "Stop" : "Record", gx, recY + recR + titleH * 0.55f, titlePaint);
+            body.setTextSize(titleH * 0.32f);
+            String st = recorder.status();
+            StaticLayout status = StaticLayout.Builder
+                    .obtain(st, 0, st.length(), body, inner)
+                    .setAlignment(Layout.Alignment.ALIGN_CENTER)
+                    .setIncludePad(false)
+                    .build();
+            canvas.save();
+            canvas.translate(left, recY + recR + titleH * 0.75f);
+            status.draw(canvas);
+            canvas.restore();
+        }
+
+        private void drawHedgeyIcon(Canvas canvas, float x, float y, float r) {
+            iconClip.reset();
+            iconClip.addCircle(x, y, r, Path.Direction.CW);
+            canvas.save();
+            canvas.clipPath(iconClip);
+            iconDest.set(x - r, y - r, x + r, y + r);
+            canvas.drawBitmap(hedgeyIcon, null, iconDest, bitmapPaint);
+            canvas.restore();
+        }
+
+        private void mapToView(float lx, float ly, float cx, float cy, float dy,
+                float rollDeg, float[] out) {
+            float x = lx;
+            float y = ly + dy;
+            double rad = Math.toRadians(rollDeg);
+            float c = (float) Math.cos(rad);
+            float s = (float) Math.sin(rad);
+            float dx = x - cx;
+            float dy2 = y - cy;
+            out[0] = cx + dx * c - dy2 * s;
+            out[1] = cy + dx * s + dy2 * c;
+        }
+
+        private void drawGlyph(Canvas canvas, int id, float x, float y, float r) {
+            glyph.setStrokeWidth(Math.max(1.8f, r * 0.14f));
+            switch (id) {
+                case 0: // hedgehog: round body + spikes
+                    glyph.setStyle(Paint.Style.FILL);
+                    oval.set(x - r * 0.72f, y - r * 0.15f, x + r * 0.72f, y + r * 0.78f);
+                    canvas.drawOval(oval, glyph);
+                    glyph.setStyle(Paint.Style.STROKE);
+                    for (int s = -4; s <= 4; s++) {
+                        float a = (float) Math.toRadians(-90 + s * 18);
+                        canvas.drawLine(
+                                x + (float) Math.cos(a) * r * 0.18f,
+                                y + (float) Math.sin(a) * r * 0.05f,
+                                x + (float) Math.cos(a) * r * 0.95f,
+                                y + (float) Math.sin(a) * r * 0.78f - r * 0.08f,
+                                glyph);
+                    }
+                    glyph.setStyle(Paint.Style.FILL);
+                    canvas.drawCircle(x + r * 0.38f, y + r * 0.22f, r * 0.09f, glyph);
+                    break;
+                case 1: // cat
+                    glyph.setStyle(Paint.Style.FILL);
+                    canvas.drawCircle(x, y + r * 0.12f, r * 0.58f, glyph);
+                    glyphPath.reset();
+                    glyphPath.moveTo(x - r * 0.52f, y + r * 0.05f);
+                    glyphPath.lineTo(x - r * 0.62f, y - r * 0.85f);
+                    glyphPath.lineTo(x - r * 0.08f, y - r * 0.22f);
+                    glyphPath.close();
+                    glyphPath.moveTo(x + r * 0.52f, y + r * 0.05f);
+                    glyphPath.lineTo(x + r * 0.62f, y - r * 0.85f);
+                    glyphPath.lineTo(x + r * 0.08f, y - r * 0.22f);
+                    glyphPath.close();
+                    canvas.drawPath(glyphPath, glyph);
+                    glyph.setColor(0xFFFFFFFF);
+                    canvas.drawCircle(x - r * 0.18f, y + r * 0.08f, r * 0.08f, glyph);
+                    canvas.drawCircle(x + r * 0.18f, y + r * 0.08f, r * 0.08f, glyph);
+                    break;
+                case 2: // dog
+                    glyph.setStyle(Paint.Style.FILL);
+                    canvas.drawCircle(x, y + r * 0.1f, r * 0.55f, glyph);
+                    oval.set(x - r * 0.95f, y - r * 0.35f, x - r * 0.28f, y + r * 0.45f);
+                    canvas.drawOval(oval, glyph);
+                    oval.set(x + r * 0.28f, y - r * 0.35f, x + r * 0.95f, y + r * 0.45f);
+                    canvas.drawOval(oval, glyph);
+                    oval.set(x - r * 0.18f, y + r * 0.28f, x + r * 0.18f, y + r * 0.72f);
+                    canvas.drawOval(oval, glyph);
+                    glyph.setColor(0xFFFFFFFF);
+                    canvas.drawCircle(x - r * 0.16f, y + r * 0.02f, r * 0.08f, glyph);
+                    canvas.drawCircle(x + r * 0.16f, y + r * 0.02f, r * 0.08f, glyph);
+                    break;
+                case 3: // lizard
+                    glyph.setStyle(Paint.Style.FILL);
+                    oval.set(x - r * 0.55f, y - r * 0.28f, x + r * 0.35f, y + r * 0.28f);
+                    canvas.drawOval(oval, glyph);
+                    canvas.drawCircle(x + r * 0.42f, y - r * 0.02f, r * 0.22f, glyph);
+                    glyph.setStyle(Paint.Style.STROKE);
+                    canvas.drawLine(x - r * 0.45f, y, x - r * 0.98f, y + r * 0.35f, glyph);
+                    canvas.drawLine(x - r * 0.1f, y - r * 0.12f, x - r * 0.05f, y - r * 0.7f, glyph);
+                    canvas.drawLine(x + r * 0.1f, y - r * 0.12f, x + r * 0.22f, y - r * 0.7f, glyph);
+                    canvas.drawLine(x - r * 0.1f, y + r * 0.12f, x - r * 0.05f, y + r * 0.7f, glyph);
+                    canvas.drawLine(x + r * 0.1f, y + r * 0.12f, x + r * 0.22f, y + r * 0.7f, glyph);
+                    break;
+                case 4: // Record
+                    glyph.setStyle(Paint.Style.FILL);
+                    canvas.drawCircle(x, y, r * 0.72f, glyph);
+                    glyph.setColor(0xFFFFFFFF);
+                    canvas.drawCircle(x, y, r * 0.28f, glyph);
+                    break;
+                default: // Writer: a page
+                    glyph.setStyle(Paint.Style.STROKE);
+                    oval.set(x - r * 0.55f, y - r * 0.7f, x + r * 0.55f, y + r * 0.7f);
+                    canvas.drawRoundRect(oval, r * 0.12f, r * 0.12f, glyph);
+                    canvas.drawLine(x - r * 0.32f, y - r * 0.32f, x + r * 0.32f, y - r * 0.32f, glyph);
+                    canvas.drawLine(x - r * 0.32f, y, x + r * 0.32f, y, glyph);
+                    canvas.drawLine(x - r * 0.32f, y + r * 0.32f, x + r * 0.12f, y + r * 0.32f, glyph);
+                    break;
+            }
+        }
+
         private void drawClickMarks(Canvas canvas, float cx, float cy) {
             long now = SystemClock.uptimeMillis();
             float viewMin = Math.min(getWidth(), getHeight());
@@ -705,9 +1325,6 @@ public class MainActivity extends Activity implements SensorEventListener, Camer
                 float age = (now - m.born) / (float) CLICK_MARK_MS;
                 if (age >= 1f) continue;
                 int a = (int) (255f * (1f - age) * (1f - age));
-                // Same canvas as the bar: rotate+pitch translate already applied.
-                // Sit at the click's elevation on that bar. Do not pan with
-                // Euler yaw — that couples into nod/roll and flies sideways.
                 float x = cx;
                 float y = cy - pitchToDy(m.pitch, viewMin);
                 buildNgon(markPath, x, y, m.radius * (0.85f + 0.15f * (1f - age)), m.sides, m.spin);
