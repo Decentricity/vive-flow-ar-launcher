@@ -2,7 +2,6 @@ package com.decentricity.arlauncher;
 
 import android.app.Activity;
 import android.content.Context;
-import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
@@ -21,7 +20,6 @@ import android.os.BatteryManager;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
-import android.os.Process;
 import android.os.SystemClock;
 import android.text.Layout;
 import android.text.StaticLayout;
@@ -29,6 +27,7 @@ import android.text.TextPaint;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.KeyEvent;
+import android.view.TextureView;
 import android.view.View;
 import android.view.WindowManager;
 import android.widget.FrameLayout;
@@ -42,7 +41,7 @@ import java.util.Date;
 import java.util.Locale;
 
 public class MainActivity extends Activity implements SensorEventListener,
-        CameraBank.Listener, ScreenRecorder.Listener {
+        CameraBank.Listener, ScreenRecorder.Listener, FileViewer.Listener {
     /**
      * Measured from cam0/cam1 stills of the monitor bank (640x480, already upright).
      * Same world point is 124px left / 10px up in CAM1 vs CAM0 (crossed + slight vertical).
@@ -76,17 +75,18 @@ public class MainActivity extends Activity implements SensorEventListener,
     private static final boolean SHOW_HORIZON_BAR = false;
     private static final boolean SHOW_SCANLINES = false;
     private static final String[] APP_NAMES = {
-            "HedgeyOS", "Cat", "Dog", "Lizard", "Record", "Writer"
+            "HedgeyOS", "Cat", "Files", "Lizard", "Record", "Writer"
     };
     private static final int[] APP_TINT = {
-            0xFFE8AFA4, 0xFFE07A3D, 0xFFC9A227, 0xFF3D9A5F, 0xFFE53935, 0xFF4A90D9
+            0xFFE8AFA4, 0xFFE07A3D, 0xFF6EC6FF, 0xFF3D9A5F, 0xFFE53935, 0xFF4A90D9
     };
     private static final int KIND_NONE = 0;
     private static final int KIND_WRITER = 1;
     private static final int KIND_ABOUT = 2;
     private static final int KIND_RECORD = 3;
+    private static final int KIND_FILES = 4;
     private static final int[] APP_KIND = {
-            KIND_ABOUT, KIND_NONE, KIND_NONE, KIND_NONE, KIND_RECORD, KIND_WRITER
+            KIND_ABOUT, KIND_NONE, KIND_FILES, KIND_NONE, KIND_RECORD, KIND_WRITER
     };
     private static final int APP_COLS = 3;
     private static final int APP_ROWS = 2;
@@ -95,11 +95,24 @@ public class MainActivity extends Activity implements SensorEventListener,
     private static final int WINDOW_WRITER = 2;
     private static final int WINDOW_ABOUT = 3;
     private static final int WINDOW_RECORD = 4;
+    private static final int WINDOW_FILES = 5;
+    private static final int FADE_NONE = 0;
+    private static final int FADE_IN = 1;
+    private static final int FADE_OUT = 2;
+    private static final long FADE_MS = 320L;
+    private static final String[] STORAGE_PERMS = {
+            android.Manifest.permission.READ_EXTERNAL_STORAGE,
+            android.Manifest.permission.WRITE_EXTERNAL_STORAGE
+    };
+    private static final String[] RECORD_PERMS = {
+            android.Manifest.permission.READ_EXTERNAL_STORAGE,
+            android.Manifest.permission.WRITE_EXTERNAL_STORAGE,
+            android.Manifest.permission.RECORD_AUDIO
+    };
     private static final long NO_APP_MS = 2400L;
     private static final String RECORD_HELP =
-            "Press a time, then Record. The visor is snapped every 1/4 second "
-            + "into a video on this headset. Recording keeps going if you close "
-            + "this window.";
+            "Press a time, then Record. 16 fps into ~/Movies, with optional mic. "
+            + "The window fades away while recording; reopen Record to stop.";
     private static final String LOREM =
             "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do "
             + "eiusmod tempor incididunt ut labore et dolore magna aliqua. "
@@ -115,6 +128,9 @@ public class MainActivity extends Activity implements SensorEventListener,
     private final StringBuilder draft = new StringBuilder(LOREM);
     private final LauncherState launcher = new LauncherState();
     private final ScreenRecorder recorder = new ScreenRecorder(this);
+    private FileBrowser files;
+    private FileViewer viewer;
+    private boolean recWasOn;
     private Bitmap hedgeyIcon;
     private final ArrayList<ClickMark> clickMarks = new ArrayList<ClickMark>();
     private float gazeYaw;
@@ -137,7 +153,6 @@ public class MainActivity extends Activity implements SensorEventListener,
     private Sensor gravSensor;
     private CameraBank cameras;
     private boolean camsStarted;
-    private boolean restarting;
     private final boolean[] camOk = new boolean[2];
     private final Runnable stopCamDelayed = new Runnable() {
         @Override
@@ -164,6 +179,8 @@ public class MainActivity extends Activity implements SensorEventListener,
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        files = new FileBrowser(this);
+        viewer = new FileViewer(this);
         sensors = (SensorManager) getSystemService(SENSOR_SERVICE);
         rotSensor = sensors.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR);
         if (rotSensor == null) {
@@ -183,13 +200,22 @@ public class MainActivity extends Activity implements SensorEventListener,
                 0, LinearLayout.LayoutParams.MATCH_PARENT, 1f);
         stereo.addView(buildEye(0), eyeLp);
         stereo.addView(buildEye(1), eyeLp);
-        setContentView(stereo);
+        FrameLayout shell = new FrameLayout(this);
+        shell.setBackgroundColor(Color.BLACK);
+        TextureView videoSink = new TextureView(this);
+        shell.addView(videoSink, new FrameLayout.LayoutParams(1280, 640));
+        shell.addView(stereo, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT));
+        viewer.attachSink(videoSink);
+        setContentView(shell);
         getWindow().addFlags(
                 WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
                         | WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
                         | WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED
                         | WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD);
         setCamChips("WAIT", "WAIT");
+        KeepAliveReceiver.schedule(this);
     }
 
     private FrameLayout buildEye(int eye) {
@@ -220,7 +246,8 @@ public class MainActivity extends Activity implements SensorEventListener,
                     FrameLayout.LayoutParams.MATCH_PARENT));
         }
 
-        Horizon horizon = new Horizon(this, clickMarks, launcher, draft, hedgeyIcon, recorder);
+        Horizon horizon = new Horizon(this, clickMarks, launcher, draft, hedgeyIcon, recorder,
+                files, viewer);
         root.addView(horizon, new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT));
@@ -273,7 +300,6 @@ public class MainActivity extends Activity implements SensorEventListener,
     @Override
     protected void onResume() {
         super.onResume();
-        if (restarting) return;
         if (rotSensor != null) {
             sensors.registerListener(this, rotSensor, SensorManager.SENSOR_DELAY_FASTEST);
         }
@@ -284,12 +310,13 @@ public class MainActivity extends Activity implements SensorEventListener,
         ui.removeCallbacks(refresh);
         ui.post(refresh);
         maybeStartCameras();
+        if (viewer != null) viewer.resume();
     }
 
     @Override
     public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);
-        if (hasFocus && !restarting) {
+        if (hasFocus) {
             maybeStartCameras();
             grabKeyboard();
         }
@@ -331,10 +358,7 @@ public class MainActivity extends Activity implements SensorEventListener,
             snapGuide();
             return;
         }
-        if (launcher.hoverRestart) {
-            restartApp();
-            return;
-        }
+        if (launcher.fade != FADE_NONE || launcher.viewerClosing) return;
         if (launcher.window != WINDOW_NONE) {
             if (launcher.hoverClose) {
                 closeWindow();
@@ -346,8 +370,40 @@ public class MainActivity extends Activity implements SensorEventListener,
                     invalidateHorizons();
                     return;
                 }
+                if (launcher.hoverMic) {
+                    recorder.setMic(!recorder.mic());
+                    invalidateHorizons();
+                    return;
+                }
                 if (launcher.hoverRecord) {
                     maybeToggleRecord();
+                    return;
+                }
+            }
+            if (launcher.window == WINDOW_FILES) {
+                if (viewer.isOpen()) {
+                    if (launcher.hoverPreview && viewer.kind() == FileViewer.KIND_VIDEO) {
+                        viewer.togglePlay();
+                        invalidateHorizons();
+                    }
+                    return;
+                }
+                if (launcher.hoverFile >= 0) {
+                    ArrayList<FileBrowser.Row> rows = files.rows();
+                    if (launcher.hoverFile < rows.size()) {
+                        FileBrowser.Row row = rows.get(launcher.hoverFile);
+                        if (row.kind == FileBrowser.KIND_FILE) {
+                            boolean was = viewer.isOpen() && !launcher.viewerClosing;
+                            viewer.open(row.target);
+                            launcher.viewerClosing = false;
+                            launcher.viewerFadeAt = was
+                                    ? SystemClock.uptimeMillis() - FADE_MS
+                                    : SystemClock.uptimeMillis();
+                        } else {
+                            files.activate(launcher.hoverFile);
+                        }
+                    }
+                    invalidateHorizons();
                     return;
                 }
             }
@@ -379,55 +435,90 @@ public class MainActivity extends Activity implements SensorEventListener,
             launcher.window = WINDOW_ABOUT;
         } else if (APP_KIND[index] == KIND_RECORD) {
             launcher.window = WINDOW_RECORD;
+        } else if (APP_KIND[index] == KIND_FILES) {
+            launcher.window = WINDOW_FILES;
+            maybeOpenFiles();
         } else {
             launcher.window = WINDOW_MISSING;
         }
+        launcher.fade = FADE_IN;
+        launcher.fadeAt = SystemClock.uptimeMillis();
         invalidateHorizons();
     }
 
+    private boolean hasStoragePerms() {
+        return checkSelfPermission(android.Manifest.permission.READ_EXTERNAL_STORAGE)
+                == PackageManager.PERMISSION_GRANTED
+                && checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private boolean hasMicPerm() {
+        return checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
+                == PackageManager.PERMISSION_GRANTED;
+    }
+
     private void maybeToggleRecord() {
-        if (checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE)
-                != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(
-                    new String[]{android.Manifest.permission.WRITE_EXTERNAL_STORAGE}, 8);
+        if (!hasStoragePerms() || (recorder.mic() && !hasMicPerm())) {
+            requestPermissions(recorder.mic() ? RECORD_PERMS : STORAGE_PERMS, 8);
             return;
         }
         recorder.toggle();
         invalidateHorizons();
     }
 
+    private void maybeOpenFiles() {
+        if (!hasStoragePerms()) {
+            requestPermissions(STORAGE_PERMS, 9);
+        }
+        files.ensureListed();
+        invalidateHorizons();
+    }
+
+    @Override
+    public void onViewerChanged() {
+        invalidateHorizons();
+    }
+
     @Override
     public void onRecorderChanged() {
+        boolean on = recorder.isRecording();
+        if (on && !recWasOn && launcher.window == WINDOW_RECORD) {
+            closeWindow();
+        }
+        recWasOn = on;
         invalidateHorizons();
     }
 
     private void closeWindow() {
-        launcher.window = WINDOW_NONE;
+        long now = SystemClock.uptimeMillis();
+        if (viewer.isOpen() && !launcher.viewerClosing) {
+            launcher.viewerClosing = true;
+            launcher.viewerFadeAt = now;
+            launcher.hoverClose = false;
+            invalidateHorizons();
+            return;
+        }
+        if (launcher.viewerClosing) return;
+        if (launcher.window == WINDOW_NONE) return;
+        if (launcher.fade == FADE_OUT) return;
+        if (launcher.fade == FADE_IN) {
+            float t = fadeProgress(launcher.fadeAt, now);
+            launcher.fade = FADE_OUT;
+            launcher.fadeAt = now - (long) ((1f - t) * FADE_MS);
+        } else {
+            launcher.fade = FADE_OUT;
+            launcher.fadeAt = now;
+        }
         launcher.hoverClose = false;
         invalidateHorizons();
     }
 
-    /**
-     * Relaunch this APK in place. Do not return to HUE: this app holds CAM0/CAM1
-     * exclusive, and Wave tracking does not reclaim those sensors cleanly.
-     * Headset reboot is a privileged Wave power-menu action, not available here.
-     */
-    private void restartApp() {
-        if (restarting) return;
-        restarting = true;
-        ui.removeCallbacks(stopCamDelayed);
-        recorder.stop();
-        stopCameras();
-        Intent i = new Intent(this, MainActivity.class);
-        i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK);
-        startActivity(i);
-        ui.postDelayed(new Runnable() {
-            @Override
-            public void run() {
-                finishAffinity();
-                Process.killProcess(Process.myPid());
-            }
-        }, 200);
+    private static float fadeProgress(long started, long now) {
+        float t = (now - started) / (float) FADE_MS;
+        if (t < 0f) t = 0f;
+        if (t > 1f) t = 1f;
+        return t * t * (3f - 2f * t);
     }
 
     private void invalidateHorizons() {
@@ -463,7 +554,6 @@ public class MainActivity extends Activity implements SensorEventListener,
     }
 
     private void maybeStartCameras() {
-        if (restarting) return;
         if (checkSelfPermission(android.Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(new String[]{android.Manifest.permission.CAMERA}, 7);
             setCamChips("L DENY", "R DENY");
@@ -475,10 +565,15 @@ public class MainActivity extends Activity implements SensorEventListener,
     @Override
     public void onRequestPermissionsResult(int code, String[] perms, int[] grant) {
         if (code == 8) {
-            if (grant.length > 0 && grant[0] == PackageManager.PERMISSION_GRANTED) {
+            if (hasStoragePerms()) {
                 recorder.toggle();
                 invalidateHorizons();
             }
+            return;
+        }
+        if (code == 9) {
+            files.ensureListed();
+            invalidateHorizons();
             return;
         }
         if (code == 7 && grant.length > 0 && grant[0] == PackageManager.PERMISSION_GRANTED) {
@@ -509,12 +604,14 @@ public class MainActivity extends Activity implements SensorEventListener,
         ui.removeCallbacks(refresh);
         ui.removeCallbacks(stopCamDelayed);
         sensors.unregisterListener(this);
+        if (viewer != null) viewer.pause();
         ui.postDelayed(stopCamDelayed, 2500);
         super.onPause();
     }
 
     @Override
     protected void onDestroy() {
+        if (viewer != null) viewer.release();
         recorder.release();
         super.onDestroy();
     }
@@ -755,12 +852,18 @@ public class MainActivity extends Activity implements SensorEventListener,
     private static final class LauncherState {
         int hover = -1;
         boolean hoverClose;
-        boolean hoverRestart;
         int hoverChip = -1;
         boolean hoverRecord;
+        boolean hoverMic;
+        int hoverFile = -1;
+        boolean hoverPreview;
         int window = WINDOW_NONE;
         int windowApp;
         long windowAt;
+        int fade;
+        long fadeAt;
+        boolean viewerClosing;
+        long viewerFadeAt;
     }
 
     private static final class ClickMark {
@@ -793,7 +896,6 @@ public class MainActivity extends Activity implements SensorEventListener,
         private final TextPaint body = new TextPaint(Paint.ANTI_ALIAS_FLAG);
         private final RectF winBox = new RectF();
         private final RectF titleBar = new RectF();
-        private final RectF menuBar = new RectF();
         private final Path glyphPath = new Path();
         private final RectF oval = new RectF();
         private final float[] mapped = new float[2];
@@ -803,6 +905,8 @@ public class MainActivity extends Activity implements SensorEventListener,
         private final StringBuilder draft;
         private final Bitmap hedgeyIcon;
         private final ScreenRecorder recorder;
+        private final FileBrowser files;
+        private final FileViewer viewer;
         private final Paint bitmapPaint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
         private final Path iconClip = new Path();
         private final RectF iconDest = new RectF();
@@ -816,13 +920,16 @@ public class MainActivity extends Activity implements SensorEventListener,
         private float guideYaw = Float.NaN;
 
         Horizon(Context context, ArrayList<ClickMark> marks, LauncherState state,
-                StringBuilder draft, Bitmap hedgeyIcon, ScreenRecorder recorder) {
+                StringBuilder draft, Bitmap hedgeyIcon, ScreenRecorder recorder,
+                FileBrowser files, FileViewer viewer) {
             super(context);
             this.marks = marks;
             this.state = state;
             this.draft = draft;
             this.hedgeyIcon = hedgeyIcon;
             this.recorder = recorder;
+            this.files = files;
+            this.viewer = viewer;
             paint.setColor(0xAAFF2A22);
             paint.setStyle(Paint.Style.STROKE);
             paint.setStrokeWidth(2.2f);
@@ -850,7 +957,7 @@ public class MainActivity extends Activity implements SensorEventListener,
             iconLabel.setTypeface(Typeface.SANS_SERIF);
             iconLabel.setTextAlign(Paint.Align.CENTER);
             iconLabel.setShadowLayer(4f, 0f, 1f, 0xCC000000);
-            winFill.setColor(0xE6141418);
+            winFill.setColor(0x80141418);
             winFill.setStyle(Paint.Style.FILL);
             winStroke.setColor(0x66FFFFFF);
             winStroke.setStyle(Paint.Style.STROKE);
@@ -870,6 +977,8 @@ public class MainActivity extends Activity implements SensorEventListener,
             body.setTypeface(Typeface.SANS_SERIF);
             body.setTextSize(compassSize * 0.55f);
             body.setAntiAlias(true);
+            body.setShadowLayer(3f, 0f, 1f, 0xCC000000);
+            titlePaint.setShadowLayer(3f, 0f, 1f, 0xCC000000);
             markFill.setStyle(Paint.Style.FILL);
             markStroke.setStyle(Paint.Style.STROKE);
             markStroke.setStrokeWidth(2.4f);
@@ -911,17 +1020,54 @@ public class MainActivity extends Activity implements SensorEventListener,
                 canvas.drawText(label, cx, cy - 6 - text.descent(), text);
             }
             if (SHOW_GUIDE) drawGuide(canvas, w, cx, cy);
+            tickFade();
             if (state.window == WINDOW_MISSING
+                    && state.fade != FADE_OUT
                     && SystemClock.uptimeMillis() - state.windowAt >= NO_APP_MS) {
-                state.window = WINDOW_NONE;
-                state.hoverClose = false;
+                state.fade = FADE_OUT;
+                state.fadeAt = SystemClock.uptimeMillis();
             }
-            if (state.window != WINDOW_NONE) {
-                state.hover = -1;
-                state.hoverRestart = false;
-                drawWindow(canvas, w, h, cx, cy, dy);
+            long now = SystemClock.uptimeMillis();
+            float t = fadeProgress(state.fadeAt, now);
+            float gridA;
+            float winA;
+            if (state.fade == FADE_IN) {
+                gridA = 1f - t;
+                winA = t;
+            } else if (state.fade == FADE_OUT) {
+                winA = 1f - t;
+                gridA = t;
+            } else if (state.window != WINDOW_NONE) {
+                winA = 1f;
+                gridA = 0f;
             } else {
+                gridA = 1f;
+                winA = 0f;
+            }
+            boolean live = state.fade == FADE_NONE;
+            if (gridA > 0.02f) {
+                canvas.saveLayerAlpha(null, (int) (gridA * 255f));
                 drawAppGrid(canvas, w, h, cx, cy, dy);
+                if (!live) state.hover = -1;
+                canvas.restore();
+            } else {
+                state.hover = -1;
+            }
+            if (winA > 0.02f && state.window != WINDOW_NONE) {
+                canvas.saveLayerAlpha(null, (int) (winA * 255f));
+                drawWindow(canvas, w, h, cx, cy, dy);
+                if (!live) {
+                    state.hoverClose = false;
+                    state.hoverChip = -1;
+                    state.hoverRecord = false;
+                    state.hoverMic = false;
+                    state.hoverFile = -1;
+                    state.hoverPreview = false;
+                }
+                canvas.restore();
+            }
+            if (state.fade != FADE_NONE || viewerFading()) {
+                postInvalidateDelayed(16);
             }
             if (SHOW_GUIDE) drawClickMarks(canvas, cx, cy);
             canvas.restore();
@@ -937,6 +1083,31 @@ public class MainActivity extends Activity implements SensorEventListener,
                 iconLabel.setTextAlign(Paint.Align.CENTER);
                 postInvalidateDelayed(200);
             }
+        }
+
+        private void tickFade() {
+            long now = SystemClock.uptimeMillis();
+            if (state.fade != FADE_NONE && now - state.fadeAt >= FADE_MS) {
+                if (state.fade == FADE_OUT) {
+                    state.window = WINDOW_NONE;
+                    state.hoverClose = false;
+                    state.hoverFile = -1;
+                    state.hoverPreview = false;
+                }
+                state.fade = FADE_NONE;
+            }
+            if (state.viewerClosing && now - state.viewerFadeAt >= FADE_MS) {
+                viewer.close();
+                state.viewerClosing = false;
+                state.hoverClose = false;
+                state.hoverPreview = false;
+            }
+        }
+
+        private boolean viewerFading() {
+            if (state.viewerClosing) return true;
+            if (!viewer.isOpen()) return false;
+            return SystemClock.uptimeMillis() - state.viewerFadeAt < FADE_MS;
         }
 
         private float guideLocalX(float cx, int w) {
@@ -964,7 +1135,6 @@ public class MainActivity extends Activity implements SensorEventListener,
             float gx = guideLocalX(cx, w);
             if (Float.isNaN(gx)) {
                 state.hover = -1;
-                state.hoverRestart = false;
                 return;
             }
             float min = Math.min(w, h);
@@ -975,12 +1145,10 @@ public class MainActivity extends Activity implements SensorEventListener,
             float gridH = gapY * (APP_ROWS - 1);
             if (gx + gridW * 0.5f + r * 2f < 0 || gx - gridW * 0.5f - r * 2f > w) {
                 state.hover = -1;
-                state.hoverRestart = false;
                 return;
             }
             float originX = gx - gridW * 0.5f;
             float originY = cy - gridH * 0.5f;
-            drawMenuBar(canvas, gx, originY, gridW, r, cx, cy, dy);
             iconLabel.setTextSize(r * 0.42f);
             int hover = -1;
             float best = r * 1.55f;
@@ -997,13 +1165,13 @@ public class MainActivity extends Activity implements SensorEventListener,
                     hover = i;
                 }
             }
-            state.hover = state.hoverRestart ? -1 : hover;
+            state.hover = hover;
             for (int i = 0; i < n; i++) {
                 int col = i % APP_COLS;
                 int row = i / APP_COLS;
                 float ix = originX + col * gapX;
                 float iy = originY + row * gapY;
-                boolean hot = i == hover && !state.hoverRestart;
+                boolean hot = i == hover;
                 float ir = r * (hot ? 1.12f : 1f);
                 if (i == 0 && hedgeyIcon != null) {
                     drawHedgeyIcon(canvas, ix, iy, ir);
@@ -1021,81 +1189,33 @@ public class MainActivity extends Activity implements SensorEventListener,
             }
         }
 
-        private void drawMenuBar(Canvas canvas, float gx, float originY, float gridW,
-                float r, float cx, float cy, float dy) {
-            float barH = r * 0.62f;
-            float barW = gridW + r * 2.2f;
-            float left = gx - barW * 0.5f;
-            float right = gx + barW * 0.5f;
-            float bot = originY - r * 1.85f;
-            float top = bot - barH;
-            menuBar.set(left, top, right, bot);
-            canvas.drawRoundRect(menuBar, barH * 0.34f, barH * 0.34f, winFill);
-            canvas.drawRoundRect(menuBar, barH * 0.34f, barH * 0.34f, winStroke);
-
-            float pad = barH * 0.16f;
-            float restartW = barH * 3.35f;
-            chipRect.set(right - pad - restartW, top + pad, right - pad, bot - pad);
-            boolean hot = chipRect.contains(cx, cy - dy);
-            state.hoverRestart = hot;
-            chipFill.setStyle(Paint.Style.FILL);
-            chipFill.setColor(hot ? 0xCCFFFFFF : 0x33FFFFFF);
-            canvas.drawRoundRect(chipRect, 6f, 6f, chipFill);
-            chipFill.setStyle(Paint.Style.STROKE);
-            chipFill.setStrokeWidth(hot ? 2.4f : 1.4f);
-            chipFill.setColor(hot ? 0xFFFFFFFF : 0x88FFFFFF);
-            canvas.drawRoundRect(chipRect, 6f, 6f, chipFill);
-            titlePaint.setTextSize(barH * 0.38f);
-            titlePaint.setColor(hot ? 0xFF111111 : 0xFFFFFFFF);
-            float base = chipRect.centerY() - (titlePaint.ascent() + titlePaint.descent()) / 2f;
-            canvas.drawText("Restart", chipRect.centerX(), base, titlePaint);
-            titlePaint.setColor(0xFFFFFFFF);
-        }
-
         private void drawWindow(Canvas canvas, int w, int h, float cx, float cy, float dy) {
             float gx = guideLocalX(cx, w);
             state.hoverClose = false;
             state.hoverChip = -1;
             state.hoverRecord = false;
+            state.hoverMic = false;
+            state.hoverFile = -1;
+            state.hoverPreview = false;
             if (Float.isNaN(gx)) return;
             float min = Math.min(w, h);
             boolean writer = state.window == WINDOW_WRITER;
             boolean about = state.window == WINDOW_ABOUT;
             boolean record = state.window == WINDOW_RECORD;
-            float boxW = min * (writer || about || record ? 0.62f : 0.52f);
-            float boxH = min * (record ? 0.48f : writer ? 0.38f : about ? 0.44f : 0.24f);
+            boolean fileWin = state.window == WINDOW_FILES;
+            float boxW = min * (fileWin ? 0.66f : writer || about || record ? 0.62f : 0.52f);
+            float boxH = min * (fileWin ? 0.56f : record ? 0.54f : writer ? 0.38f : about ? 0.44f : 0.24f);
             float titleH = min * 0.048f;
             float left = gx - boxW * 0.5f;
             float top = cy - boxH * 0.5f;
             winBox.set(left, top, left + boxW, top + boxH);
             if (winBox.right < -20 || winBox.left > w + 20) return;
-            float rad = Math.min(16f, titleH * 0.45f);
-            canvas.drawRoundRect(winBox, rad, rad, winFill);
-            canvas.drawRoundRect(winBox, rad, rad, winStroke);
-            titleBar.set(winBox.left, winBox.top, winBox.right, winBox.top + titleH);
-            canvas.drawRoundRect(titleBar, rad, rad, winTitleFill);
-            canvas.drawRect(winBox.left, winBox.top + titleH * 0.4f, winBox.right,
-                    winBox.top + titleH, winTitleFill);
-
-            float closeX = winBox.left + titleH * 0.55f;
-            float closeY = winBox.top + titleH * 0.5f;
-            float closeR = titleH * 0.28f;
-            mapToView(closeX, closeY, cx, cy, dy, roll, mapped);
-            boolean hot = Math.hypot(mapped[0] - cx, mapped[1] - cy) < closeR * 3.2f;
-            state.hoverClose = hot;
-            closeFill.setColor(hot ? 0xFFFF7A73 : 0xFFE85D55);
-            canvas.drawCircle(closeX, closeY, closeR, closeFill);
-            closeXPaint.setStrokeWidth(Math.max(1.6f, closeR * 0.28f));
-            float xarm = closeR * 0.38f;
-            canvas.drawLine(closeX - xarm, closeY - xarm, closeX + xarm, closeY + xarm, closeXPaint);
-            canvas.drawLine(closeX - xarm, closeY + xarm, closeX + xarm, closeY - xarm, closeXPaint);
-
+            boolean viewing = fileWin && viewer.isOpen();
             int app = state.windowApp;
             if (app < 0 || app >= APP_NAMES.length) app = 0;
-            String title = writer ? "Writer" : about ? "About" : record ? "Record" : APP_NAMES[app];
-            titlePaint.setTextSize(titleH * 0.42f);
-            float titleBase = winBox.top + (titleH - titlePaint.ascent() - titlePaint.descent()) / 2f;
-            canvas.drawText(title, gx, titleBase, titlePaint);
+            String title = writer ? "Writer" : about ? "About" : record ? "Record"
+                    : fileWin ? "Files" : APP_NAMES[app];
+            paintChrome(canvas, gx, cx, cy, dy, titleH, title, !viewing);
 
             float pad = titleH * 0.35f;
             float contentLeft = winBox.left + pad;
@@ -1106,6 +1226,26 @@ public class MainActivity extends Activity implements SensorEventListener,
                 drawRecordPanel(canvas, cx, gx, cy, dy, contentLeft, contentTop, contentRight,
                         contentBot, titleH, pad);
                 if (recorder.isRecording()) postInvalidateDelayed(200);
+                return;
+            }
+            if (fileWin) {
+                drawFilesPanel(canvas, cx, cy, dy, contentLeft, contentTop, contentRight,
+                        contentBot, titleH);
+                float va = 0f;
+                long now = SystemClock.uptimeMillis();
+                if (state.viewerClosing) {
+                    va = 1f - fadeProgress(state.viewerFadeAt, now);
+                } else if (viewer.isOpen()) {
+                    va = fadeProgress(state.viewerFadeAt, now);
+                }
+                if (va > 0.02f) {
+                    canvas.saveLayerAlpha(null, (int) (va * 255f));
+                    drawViewerWindow(canvas, w, h, gx, cx, cy, dy, min, titleH);
+                    canvas.restore();
+                    if (viewer.kind() == FileViewer.KIND_VIDEO) postInvalidateDelayed(70);
+                }
+                if (va > 0.15f) state.hoverFile = -1;
+                if (state.viewerClosing) state.hoverPreview = false;
                 return;
             }
             if (about && hedgeyIcon != null) {
@@ -1140,6 +1280,178 @@ public class MainActivity extends Activity implements SensorEventListener,
             }
             canvas.restore();
             if (writer) postInvalidateDelayed(50);
+        }
+
+        private void paintChrome(Canvas canvas, float gx, float cx, float cy, float dy,
+                float titleH, String title, boolean hitTestClose) {
+            float rad = Math.min(16f, titleH * 0.45f);
+            canvas.drawRoundRect(winBox, rad, rad, winFill);
+            canvas.drawRoundRect(winBox, rad, rad, winStroke);
+            titleBar.set(winBox.left, winBox.top, winBox.right, winBox.top + titleH);
+            canvas.drawRoundRect(titleBar, rad, rad, winTitleFill);
+            canvas.drawRect(winBox.left, winBox.top + titleH * 0.4f, winBox.right,
+                    winBox.top + titleH, winTitleFill);
+
+            float closeX = winBox.left + titleH * 0.55f;
+            float closeY = winBox.top + titleH * 0.5f;
+            float closeR = titleH * 0.28f;
+            boolean hot = false;
+            if (hitTestClose) {
+                mapToView(closeX, closeY, cx, cy, dy, roll, mapped);
+                hot = Math.hypot(mapped[0] - cx, mapped[1] - cy) < closeR * 3.2f;
+                state.hoverClose = hot;
+            }
+            closeFill.setColor(hot ? 0xFFFF7A73 : 0xFFE85D55);
+            canvas.drawCircle(closeX, closeY, closeR, closeFill);
+            closeXPaint.setStrokeWidth(Math.max(1.6f, closeR * 0.28f));
+            float xarm = closeR * 0.38f;
+            canvas.drawLine(closeX - xarm, closeY - xarm, closeX + xarm, closeY + xarm, closeXPaint);
+            canvas.drawLine(closeX - xarm, closeY + xarm, closeX + xarm, closeY - xarm, closeXPaint);
+
+            titlePaint.setTextSize(titleH * 0.42f);
+            titlePaint.setColor(0xFFFFFFFF);
+            float titleBase = winBox.top + (titleH - titlePaint.ascent() - titlePaint.descent()) / 2f;
+            canvas.drawText(title, gx, titleBase, titlePaint);
+        }
+
+        private void drawViewerWindow(Canvas canvas, int w, int h, float gx, float cx, float cy,
+                float dy, float min, float titleH) {
+            float boxW = min * 0.70f;
+            float boxH = min * 0.58f;
+            float left = gx - boxW * 0.5f + min * 0.02f;
+            float top = cy - boxH * 0.5f - min * 0.02f;
+            winBox.set(left, top, left + boxW, top + boxH);
+            if (winBox.right < -20 || winBox.left > w + 20) return;
+            String title = FileBrowser.ellipsize(viewer.title(), 28);
+            paintChrome(canvas, winBox.centerX(), cx, cy, dy, titleH, title, true);
+            float pad = titleH * 0.35f;
+            float contentLeft = winBox.left + pad;
+            float contentTop = winBox.top + titleH + pad;
+            float contentRight = winBox.right - pad;
+            float contentBot = winBox.bottom - pad;
+            int kind = viewer.kind();
+            if (kind == FileViewer.KIND_IMAGE || kind == FileViewer.KIND_VIDEO) {
+                iconDest.set(contentLeft, contentTop, contentRight, contentBot);
+                viewer.drawMedia(canvas, iconDest, bitmapPaint);
+                float rx = cx;
+                float ry = cy - dy;
+                state.hoverPreview = iconDest.contains(rx, ry);
+                if (kind == FileViewer.KIND_VIDEO && !viewer.isPlaying()) {
+                    float s = Math.min(iconDest.width(), iconDest.height()) * 0.12f;
+                    float px = iconDest.centerX();
+                    float py = iconDest.centerY();
+                    glyphPath.reset();
+                    glyphPath.moveTo(px - s * 0.45f, py - s);
+                    glyphPath.lineTo(px - s * 0.45f, py + s);
+                    glyphPath.lineTo(px + s, py);
+                    glyphPath.close();
+                    chipFill.setStyle(Paint.Style.FILL);
+                    chipFill.setColor(state.hoverPreview ? 0xEEFFFFFF : 0xCCFFFFFF);
+                    canvas.drawPath(glyphPath, chipFill);
+                }
+                if (viewer.error().length() > 0) {
+                    body.setTextAlign(Paint.Align.CENTER);
+                    body.setColor(0xFFFFE08A);
+                    body.setTextSize(titleH * 0.36f);
+                    canvas.drawText(viewer.error(), winBox.centerX(),
+                            contentTop + body.getTextSize(), body);
+                    body.setTextAlign(Paint.Align.LEFT);
+                    body.setColor(0xFFE8E8EA);
+                }
+                return;
+            }
+            String src = viewer.error().length() > 0 ? viewer.error() : viewer.text();
+            if (src == null) src = "";
+            int inner = Math.max(8, (int) (contentRight - contentLeft));
+            body.setTextAlign(Paint.Align.LEFT);
+            body.setColor(0xFFE8E8EA);
+            body.setTextSize(titleH * 0.34f);
+            StaticLayout layout = StaticLayout.Builder
+                    .obtain(src, 0, src.length(), body, inner)
+                    .setAlignment(Layout.Alignment.ALIGN_NORMAL)
+                    .setIncludePad(false)
+                    .build();
+            float ry = cy - dy;
+            float scroll = 0f;
+            float extra = layout.getHeight() - (contentBot - contentTop);
+            if (extra > 0f && contentTop <= ry && ry <= contentBot) {
+                float t = (ry - contentTop) / Math.max(1f, contentBot - contentTop);
+                if (t < 0f) t = 0f;
+                if (t > 1f) t = 1f;
+                scroll = t * extra;
+            }
+            canvas.save();
+            canvas.clipRect(contentLeft, contentTop, contentRight, contentBot);
+            canvas.translate(contentLeft, contentTop - scroll);
+            layout.draw(canvas);
+            canvas.restore();
+        }
+
+        private void drawFilesPanel(Canvas canvas, float cx, float cy, float dy,
+                float left, float top, float right, float bot, float titleH) {
+            float rx = cx;
+            float ry = cy - dy;
+            files.ensureListed();
+            body.setTextAlign(Paint.Align.LEFT);
+            body.setTextSize(titleH * 0.32f);
+            body.setColor(0xFFAAAAAA);
+            String path = FileBrowser.ellipsize(files.pathLabel(), 42);
+            if (files.error().length() > 0) {
+                path = path + "  (" + files.error() + ")";
+            }
+            canvas.drawText(path, left, top + body.getTextSize(), body);
+            float listTop = top + body.getTextSize() + titleH * 0.28f;
+            float lineH = titleH * 0.70f;
+            int visible = Math.max(1, (int) ((bot - listTop) / lineH));
+            ArrayList<FileBrowser.Row> rows = files.rows();
+            int n = rows.size();
+            int hover = -1;
+            int start = 0;
+            if (listTop <= ry && ry < listTop + visible * lineH && n > 0) {
+                if (n <= visible) {
+                    hover = (int) ((ry - listTop) / lineH);
+                    if (hover < 0 || hover >= n) hover = -1;
+                } else {
+                    float t = (ry - listTop) / (visible * lineH);
+                    if (t < 0f) t = 0f;
+                    if (t > 0.999f) t = 0.999f;
+                    hover = (int) (t * n);
+                    start = hover - visible / 2;
+                    int maxStart = n - visible;
+                    if (start < 0) start = 0;
+                    if (start > maxStart) start = maxStart;
+                }
+            }
+            state.hoverFile = hover;
+            body.setTextSize(titleH * 0.36f);
+            canvas.save();
+            canvas.clipRect(left, listTop, right, bot);
+            for (int i = 0; i < visible && start + i < n; i++) {
+                int idx = start + i;
+                FileBrowser.Row row = rows.get(idx);
+                float y0 = listTop + i * lineH;
+                boolean hot = idx == hover;
+                if (hot) {
+                    chipRect.set(left, y0, right, y0 + lineH);
+                    chipFill.setStyle(Paint.Style.FILL);
+                    chipFill.setColor(0x33FFFFFF);
+                    canvas.drawRoundRect(chipRect, 4f, 4f, chipFill);
+                }
+                int color;
+                if (row.kind == FileBrowser.KIND_HOME || row.kind == FileBrowser.KIND_UP) {
+                    color = hot ? 0xFFFFE08A : 0xFFE0B85A;
+                } else if (row.kind == FileBrowser.KIND_DIR) {
+                    color = hot ? 0xFFB8E0FF : 0xFF6EC6FF;
+                } else {
+                    color = hot ? 0xFFFFFFFF : 0xFFCCCCCC;
+                }
+                body.setColor(color);
+                float base = y0 + (lineH - body.ascent() - body.descent()) / 2f;
+                canvas.drawText(row.name, left + 6f, base, body);
+            }
+            canvas.restore();
+            body.setColor(0xFFE8E8EA);
+            titlePaint.setColor(0xFFFFFFFF);
         }
 
         private void drawRecordPanel(Canvas canvas, float cx, float gx, float cy, float dy,
@@ -1183,11 +1495,29 @@ public class MainActivity extends Activity implements SensorEventListener,
             }
             state.hoverChip = hoverChip;
             titlePaint.setColor(0xFFFFFFFF);
-            y += chipH + pad * 1.1f;
+            y += chipH + pad * 0.7f;
+            float micW = Math.min((right - left) * 0.34f, chipW * 1.6f);
+            chipRect.set(gx - micW * 0.5f, y, gx + micW * 0.5f, y + chipH);
+            boolean micOn = recorder.mic();
+            boolean micHot = chipRect.contains(rx, ry);
+            state.hoverMic = micHot && hoverChip < 0;
+            chipFill.setStyle(Paint.Style.FILL);
+            chipFill.setColor(micOn ? 0xCCFFFFFF : micHot ? 0x44FFFFFF : 0x22FFFFFF);
+            canvas.drawRoundRect(chipRect, 8f, 8f, chipFill);
+            chipFill.setStyle(Paint.Style.STROKE);
+            chipFill.setStrokeWidth(micOn ? 2.6f : 1.6f);
+            chipFill.setColor(micOn || micHot ? 0xFFFFFFFF : 0x66FFFFFF);
+            canvas.drawRoundRect(chipRect, 8f, 8f, chipFill);
+            titlePaint.setTextSize(chipH * 0.40f);
+            titlePaint.setColor(micOn ? 0xFF111111 : 0xFFFFFFFF);
+            float micBase = chipRect.centerY() - (titlePaint.ascent() + titlePaint.descent()) / 2f;
+            canvas.drawText(micOn ? "Mic on" : "Muted", chipRect.centerX(), micBase, titlePaint);
+            titlePaint.setColor(0xFFFFFFFF);
+            y += chipH + pad * 1.0f;
             float recR = titleH * 0.85f;
             float recY = Math.min(y + recR, bot - recR - titleH);
             boolean recHot = Math.hypot(rx - gx, ry - recY) < recR * 1.35f;
-            state.hoverRecord = recHot && hoverChip < 0;
+            state.hoverRecord = recHot && hoverChip < 0 && !state.hoverMic;
             boolean recording = recorder.isRecording();
             recDot.setColor(recording ? (recHot ? 0xFFFFC107 : 0xFFFFB300) : (recHot ? 0xFFFF6B63 : 0xFFE53935));
             canvas.drawCircle(gx, recY, recR, recDot);
@@ -1275,18 +1605,12 @@ public class MainActivity extends Activity implements SensorEventListener,
                     canvas.drawCircle(x - r * 0.18f, y + r * 0.08f, r * 0.08f, glyph);
                     canvas.drawCircle(x + r * 0.18f, y + r * 0.08f, r * 0.08f, glyph);
                     break;
-                case 2: // dog
+                case 2: // files: folder tab
                     glyph.setStyle(Paint.Style.FILL);
-                    canvas.drawCircle(x, y + r * 0.1f, r * 0.55f, glyph);
-                    oval.set(x - r * 0.95f, y - r * 0.35f, x - r * 0.28f, y + r * 0.45f);
-                    canvas.drawOval(oval, glyph);
-                    oval.set(x + r * 0.28f, y - r * 0.35f, x + r * 0.95f, y + r * 0.45f);
-                    canvas.drawOval(oval, glyph);
-                    oval.set(x - r * 0.18f, y + r * 0.28f, x + r * 0.18f, y + r * 0.72f);
-                    canvas.drawOval(oval, glyph);
-                    glyph.setColor(0xFFFFFFFF);
-                    canvas.drawCircle(x - r * 0.16f, y + r * 0.02f, r * 0.08f, glyph);
-                    canvas.drawCircle(x + r * 0.16f, y + r * 0.02f, r * 0.08f, glyph);
+                    oval.set(x - r * 0.62f, y - r * 0.08f, x + r * 0.62f, y + r * 0.55f);
+                    canvas.drawRoundRect(oval, r * 0.12f, r * 0.12f, glyph);
+                    oval.set(x - r * 0.62f, y - r * 0.42f, x - r * 0.02f, y + r * 0.05f);
+                    canvas.drawRoundRect(oval, r * 0.10f, r * 0.10f, glyph);
                     break;
                 case 3: // lizard
                     glyph.setStyle(Paint.Style.FILL);
