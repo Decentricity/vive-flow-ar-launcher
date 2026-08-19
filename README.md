@@ -1,10 +1,16 @@
 # Vive Flow AR Launcher
 
+![AR Launcher on a Vive Flow](media/ar-launcher-demo.gif)
+
+[Full recording (MP4, with audio)](media/ar-launcher-demo.mp4)
+
 A 3D visor launcher for the [HTC Vive Flow](https://www.vive.com/us/product/vive-flow/specs/), grown from [Flow HUD](https://github.com/Decentricity/vive-flow-hud).
 
-A 3×2 grid of apps (**HedgeyOS**, Cat, Dog, Lizard, **Record**, **Writer**) floats on the passthrough with no panel behind it. The grid is locked to the hidden **guide**: same gravity horizon, same compass heading. A thin menu bar sits above the icons; **Restart** on the right relaunches this APK.
+A 3×2 grid of apps (**HedgeyOS**, Cat, **Files**, Lizard, **Record**, **Writer**) floats on the passthrough with no panel behind it. The grid is locked to the hidden **guide**: same gravity horizon, same compass heading.
 
-Opening an app puts a window on that same guide — title bar, close **X** at the top left. **HedgeyOS** opens an About window (the hand-drawn hedgehog from [hedgeyos/hedgeyos](https://github.com/hedgeyos/hedgeyos)). **Record** snaps the visor every 1/4 second into an MP4 under `Movies/ARLauncher/` for 5s / 10s / 30s / 1m / 5m; capture keeps going if you close the window, and reopening shows Stop until you halt it. Dummy icons show `No such app found! closing...` and dismiss after a moment. **Writer** stays open: the text box from [AR Writer](https://github.com/Decentricity/vive-flow-ar-writer), locked to the guide, typed from a Bluetooth keyboard.
+Opening an app fades the grid out and a window in on that same guide — title bar, close **X** at the top left, glass fill so the cameras show through. Closing **X** fades the window out and the grid back in. **HedgeyOS** opens an About window (the hand-drawn hedgehog from [hedgeyos/hedgeyos](https://github.com/hedgeyos/hedgeyos)). **Files** lands in Android shared storage (`/storage/emulated/0`). Look at a name and volume-up to open a folder; **`~`** jumps home, **`..`** goes up. Volume-up on an image, video, or text file fades in a second guide-locked window on top of the listing: pictures display, videos play, text shows. **X** on that preview fades back to the listing. **Record** snaps the visor at **16 fps** into an MP4 under **`~/Movies`** (`/storage/emulated/0/Movies`, `rec-*.mp4`) for 5s / 10s / 30s / 1m / 5m, with a **Mic on / Muted** toggle (AAC, default on). Pressing Record fades the window away to the grid while capture continues; reopen Record to Stop. Dummy icons show `No such app found! closing...` and fade out after a moment. **Writer** stays open: the text box from [AR Writer](https://github.com/Decentricity/vive-flow-ar-writer), locked to the guide, typed from a Bluetooth keyboard.
+
+There is no in-app Exit or Restart. Closing Camera2 and returning to HUE (or even restarting this process) has already lost Wave tracking. Stay in this APK.
 
 Flip `SHOW_GUIDE` in `MainActivity` to draw the white guide line again for heading debug.
 
@@ -12,26 +18,18 @@ HUE tile: **AR Launcher**.
 
 Heading uses the visor-forward axis projected onto world east/north, not Euler azimuth, so nodding does not send the guide flying. If you are looking almost straight up or down, the heading is frozen until the visor faces the world again.
 
-## Stay in this app (kiosk)
+## Stay in this app
 
-**Suggested: pin AR Launcher as HUE kiosk single-app.** Do not use Android Home / an in-app Exit to return to HUE.
+This APK starts itself on the visor (no PC required):
 
-This APK is not a Wave client. It takes exclusive Camera2 on CAM0/CAM1 for stereo passthrough. Stock Flow VR apps never do that — tracking and passthrough stay inside Wave. HUE is still paused underneath our task, and its 6DoF / hand mesh need those same sensors. Handing the cameras back after Exit showed HUE for a moment, then **tracking lost**, a glitched hand asset, and a visor that needed a long-press power cycle. Intermittent, but the handoff is not something Wave was written to do.
+- `BootReceiver` pokes MainActivity several times after headset boot
+- `KeepAliveReceiver` is an on-device alarm: if another activity is in front, bring AR Launcher forward
 
-HUE kiosk is not Android lock-task and does not replace the system launcher. It is HUE’s own filter: hide the library and auto-launch one `VRAPP`. AR Launcher already has `com.htc.intent.category.VRAPP`, so HUE can list it. Long-press the **headset button** → **Quit Kiosk mode** to leave (that path stays inside Wave).
+This development PC is USB-only. Do not enable `vive-flow-arlauncher.service` for daily use.
 
-ADB cannot write the assignment. Kiosk app, activity, and `kiosk_mode` live in Wave OEM’s `oemdata.db` (`content://oem_data/miac_config`), and writes need the signature permission `vive.wave.vr.oem.data.OEMDataWrite`.
+Unstick during development: `adb -s FA22B2S00442 shell am start -n com.decentricity.arlauncher/.MainActivity`
 
-On the visor (needs the phone/VR controller for HUE Settings):
-
-1. Back to Home
-2. **Settings → Kiosk Mode**
-3. **Assign apps → Single app → AR Launcher**
-4. **Enter Kiosk Mode**
-
-Or set the same single-app kiosk from the VIVE / VIVE Manager phone app.
-
-**Restart** on the menu bar only relaunches this APK. It does not go to HUE. Headset reboot is not exposed to a third-party app (`PowerManager.reboot` is privileged). The Wave power menu (long-press the headset button) can power off / reboot; a later Restart mode might call that if a safe intent shows up.
+This APK is not a Wave client. It takes exclusive Camera2 on CAM0/CAM1 for stereo passthrough. Stock Flow VR apps never do that. Handing the cameras back to HUE has already lost tracking.
 
 ## Run
 
@@ -41,15 +39,18 @@ export ANDROID_SDK_ROOT=/path/to/sdk
 SERIAL=FA22B2S00442
 adb -s "$SERIAL" install -r ar-launcher.apk
 adb -s "$SERIAL" shell pm grant com.decentricity.arlauncher android.permission.CAMERA
+adb -s "$SERIAL" shell pm grant com.decentricity.arlauncher android.permission.READ_EXTERNAL_STORAGE
+adb -s "$SERIAL" shell pm grant com.decentricity.arlauncher android.permission.WRITE_EXTERNAL_STORAGE
+adb -s "$SERIAL" shell pm grant com.decentricity.arlauncher android.permission.RECORD_AUDIO
 adb -s "$SERIAL" shell am start -n com.decentricity.arlauncher/.MainActivity
 ```
 
 | Control | |
 | --- | --- |
-| Volume **up** | Open the app under the reticle, click the window **X** to close, or click **Restart** to relaunch this APK |
+| Volume **up** | Open the app under the reticle, click the window **X**, Files / preview / pause-play, Record duration / mic / start |
 | Volume **down** | Snap the hidden guide (grid + windows) to the reticle heading |
 | BT keyboard | Type into Writer while its window is open |
-| Headset button (long press) | Wave power menu: quit kiosk, power off, reboot |
+| Headset button (long press) | Wave power menu (power off / reboot) |
 
 Treat the Flow as an untrusted Android 9 display. Do not put secrets on it.
 
